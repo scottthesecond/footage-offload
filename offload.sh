@@ -303,7 +303,7 @@ do_verify() {
 }
 
 # Main script
-case "$1" in
+case "${1:-}" in
     "offload")
         do_offload
         ;;
