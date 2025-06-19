@@ -4,8 +4,40 @@
 set -e
 set -u
 
+# Parse command line arguments
+DEBUG=0
+COMMAND=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -debug|--debug)
+            DEBUG=1
+            shift
+            ;;
+        offload|verify)
+            COMMAND="$1"
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 [-debug] {offload|verify}"
+            echo "  -debug: Enable debug output"
+            echo "  offload: Offload files from SD cards"
+            echo "  verify:  Verify previously offloaded files"
+            exit 1
+            ;;
+    esac
+done
+
 # Error handling
 trap 'echo "Error occurred. Cleaning up..."' ERR
+
+# Debug function
+debug_echo() {
+    if [ "$DEBUG" -eq 1 ]; then
+        echo "[DEBUG] $1"
+    fi
+}
 
 # Configuration
 OFFLOAD_COUNTER_FILE="$HOME/.offload_counter"
@@ -22,7 +54,14 @@ get_next_folder_number() {
 
 # Function to get mounted SD cards
 get_mounted_cards() {
-    mount | grep -i "sd" | awk '{print $3}'
+    mount | awk '
+        $1 ~ /^\/dev\// && $3 ~ /^\/Volumes\// {
+            fs = $4
+            gsub(/^[ (]+|[,)]*$/, "", fs)
+            if (fs ~ /^(exfat|fat32|msdos|vfat|ntfs|hfs|hfsplus|apfs)$/)
+                print $3
+        }
+    '
 }
 
 # Function to create destination folder
@@ -32,6 +71,8 @@ create_destination_folder() {
     local card_type="$3"
     local folder_number=$(get_next_folder_number)
     
+    debug_echo "Creating folder with: project=$project_shortname, card=$card_name, type=$card_type, number=$folder_number"
+    
     local type_prefix=""
     case "$card_type" in
         "Video") type_prefix="v" ;;
@@ -39,28 +80,28 @@ create_destination_folder() {
         "Photo") type_prefix="P" ;;
     esac
     
+    debug_echo "Type prefix: '$type_prefix'"
+    
     local folder_name="${type_prefix}${folder_number}.${project_shortname}.${card_name}"
+    debug_echo "Generated folder name: '$folder_name'"
     echo "$folder_name"
 }
 
 # Function to get card type from user
 get_card_type() {
-    echo "Select card type:"
-    echo "1) Video"
-    echo "2) Audio"
-    echo "3) Photo"
-    echo "4) Maintain Folder Structure"
-    echo "5) Skip"
-    read -p "Enter choice (1-5): " card_type
-    
-    case "$card_type" in
-        1) echo "Video" ;;
-        2) echo "Audio" ;;
-        3) echo "Photo" ;;
-        4) echo "Maintain" ;;
-        5) echo "Skip" ;;
-        *) echo "Invalid" ;;
-    esac
+    echo "Select card type:" >&2
+    PS3="Enter choice (1-5): "
+    options=("Video" "Audio" "Photo" "Maintain Folder Structure" "Skip")
+    select opt in "${options[@]}"; do
+        case $opt in
+            "Video") echo "Video"; break ;;
+            "Audio") echo "Audio"; break ;;
+            "Photo") echo "Photo"; break ;;
+            "Maintain Folder Structure") echo "Maintain"; break ;;
+            "Skip") echo "Skip"; break ;;
+            *) echo "Invalid option $REPLY. Please select 1-5." ;;
+        esac
+    done
 }
 
 # Function to process a card
@@ -71,17 +112,40 @@ process_card() {
     local card_type="$4"
     local card_name="$5"
     
+    echo "Processing card: $card"
+    echo "Project: $project_name"
+    echo "Destination path: $dest_path"
+    echo "Card type: $card_type"
+    echo "Card name: $card_name"
+    
+    debug_echo "process_card called with: card=$card, project=$project_name, dest_path=$dest_path, type=$card_type, name=$card_name"
+    
     # Create destination folder
     local dest_folder=$(create_destination_folder "$project_name" "$card_name" "$card_type")
-    mkdir -p "$dest_path/$dest_folder"
+    debug_echo "create_destination_folder returned: '$dest_folder'"
+    
+    local full_dest_path="$dest_path/$dest_folder"
+    debug_echo "Full destination path: '$full_dest_path'"
+    
+    echo "Creating destination folder: $full_dest_path"
+    mkdir -p "$full_dest_path"
+    
+    if [ -d "$full_dest_path" ]; then
+        echo "Destination folder created successfully: $full_dest_path"
+        debug_echo "Directory exists and is writable: $(test -w "$full_dest_path" && echo "yes" || echo "no")"
+    else
+        echo "ERROR: Failed to create destination folder!"
+        debug_echo "mkdir exit code: $?"
+        return 1
+    fi
     
     # Offload files
-    offload_files "$card" "$dest_path/$dest_folder" "$card_type"
+    offload_files "$card" "$full_dest_path" "$card_type"
     
     # Ask about verification
     read -p "Offload complete. Would you like to verify now? (y/n): " verify_now
     if [ "$verify_now" = "y" ]; then
-        if verify_files "$card" "$dest_path/$dest_folder"; then
+        if verify_files "$card" "$full_dest_path"; then
             read -p "Verification successful. Format card? (y/n): " format_card
             if [ "$format_card" = "y" ]; then
                 echo "Formatting card..."
@@ -100,6 +164,7 @@ check_existing_transfer() {
     if [ -f "$source/.offload" ]; then
         echo "Found existing .offload file on card at $source"
         local stored_dest=$(grep "^DEST_PATH=" "$source/.offload" | cut -d'=' -f2)
+        stored_dest=$(clean_path "$stored_dest")
         local stored_project=$(grep "^PROJECT=" "$source/.offload" | cut -d'=' -f2)
         local stored_card=$(grep "^CARD_NAME=" "$source/.offload" | cut -d'=' -f2)
         
@@ -136,6 +201,37 @@ offload_files() {
     local dest="$2"
     local card_type="$3"
     
+    echo "Starting offload from $source to $dest (type: $card_type)"
+    debug_echo "Source: $source"
+    debug_echo "Destination: $dest"
+    debug_echo "Card type: $card_type"
+    
+    # Check if source directory exists and is readable
+    if [ ! -d "$source" ]; then
+        echo "ERROR: Source directory does not exist: $source"
+        return 1
+    fi
+    
+    if [ ! -r "$source" ]; then
+        echo "ERROR: Source directory is not readable: $source"
+        return 1
+    fi
+    
+    debug_echo "Source directory exists and is readable"
+    
+    # Check if destination directory exists and is writable
+    if [ ! -d "$dest" ]; then
+        echo "ERROR: Destination directory does not exist: $dest"
+        return 1
+    fi
+    
+    if [ ! -w "$dest" ]; then
+        echo "ERROR: Destination directory is not writable: $dest"
+        return 1
+    fi
+    
+    debug_echo "Destination directory exists and is writable"
+    
     # Create .offload file
     echo "VERSION=1.0" > "$source/.offload"
     echo "PROJECT=$PROJECT_NAME" >> "$source/.offload"
@@ -146,41 +242,129 @@ offload_files() {
     
     case "$card_type" in
         "Video")
+            echo "Processing Video files..."
+            echo "Searching for files in $source..."
+            
+            # First, let's see what's in the source directory
+            echo "Contents of source directory:"
+            ls -la "$source"
+            
+            # Create a temporary file list to avoid subshell issues
+            local temp_file_list="/tmp/offload_files_$$.txt"
+            debug_echo "Creating temporary file list: $temp_file_list"
+            
             # Skip AVCHD files less than 2MB and system files
-            find "$source" -type f -not \( -name "*.thumbs" -o -name "*.xml" -o -name "*.CTG" -o -name "*.DAT" -o -name "*.CPC" -o -name "*.CPG" -o -name "*.B00" -o -name "*.D00" -o -name "*.SCR" -o -name "*.THM" -o -name "*.log" -o -name "*.jpg" \) -print0 | while IFS= read -r -d '' file; do
-                # Skip AVCHD files less than 2MB
-                if [[ "$file" == *"AVCHD"* ]] && [ $(stat -f%z "$file") -lt 2097152 ]; then
-                    echo "Skipping small AVCHD file: $file"
-                    continue
+            echo "Running find command..."
+            find "$source" -type f -not \( -name "*.thumbs" -o -name "*.xml" -o -name "*.XML" -o -name "*.CTG" -o -name "*.DAT" -o -name "*.CPC" -o -name "*.CPG" -o -name "*.B00" -o -name "*.D00" -o -name "*.SCR" -o -name "*.THM" -o -name "*.log" -o -name "*.jpg" \) > "$temp_file_list"
+            
+            debug_echo "Find command completed with exit code: $?"
+            debug_echo "Found $(wc -l < "$temp_file_list") files to process"
+            
+            # Show the first few files found for debugging
+            if [ -s "$temp_file_list" ]; then
+                echo "First 5 files found:"
+                head -5 "$temp_file_list"
+            else
+                echo "WARNING: No files found by find command!"
+                echo "Trying simpler find command..."
+                find "$source" -type f > "$temp_file_list"
+                debug_echo "Simple find found $(wc -l < "$temp_file_list") files"
+                if [ -s "$temp_file_list" ]; then
+                    echo "First 5 files found (simple find):"
+                    head -5 "$temp_file_list"
                 fi
-                rsync --progress "$file" "$dest/"
-                echo "$file=$(md5sum "$file" | cut -d' ' -f1)" >> "$source/.offload"
-            done
+            fi
+            
+            local copied_count=0
+            while IFS= read -r file; do
+                debug_echo "Processing file: $file"
+                echo "Found file: $file"
+                
+                # Skip AVCHD files less than 2MB
+                if [[ "$file" == *"AVCHD"* ]]; then
+                    local file_size=$(stat -f%z "$file" 2>/dev/null || echo "0")
+                    debug_echo "AVCHD file size: $file_size bytes"
+                    if [ "$file_size" -lt 2097152 ]; then
+                        echo "Skipping small AVCHD file: $file"
+                        continue
+                    fi
+                fi
+                
+                echo "Copying: $file"
+                debug_echo "rsync command: rsync --progress \"$file\" \"$dest/\""
+                if rsync --progress "$file" "$dest/"; then
+                    echo "Successfully copied: $file"
+                    echo "$file=$(md5 -q "$file")" >> "$source/.offload"
+                    copied_count=$((copied_count + 1))
+                else
+                    echo "ERROR: Failed to copy: $file"
+                    debug_echo "rsync exit code: $?"
+                fi
+            done < "$temp_file_list"
+            
+            echo "Find command completed. Copied $copied_count files."
+            rm -f "$temp_file_list"
             ;;
         "Audio")
-            # Skip system files
-            find "$source" -type f -not \( -name "*.SYS" -o -name "*.ZST" \) -print0 | while IFS= read -r -d '' file; do
-                rsync --progress "$file" "$dest/"
-                echo "$file=$(md5sum "$file" | cut -d' ' -f1)" >> "$source/.offload"
-            done
+            echo "Processing Audio files..."
+            # Create a temporary file list to avoid subshell issues
+            local temp_file_list="/tmp/offload_files_$$.txt"
+            find "$source" -type f -not \( -name "*.SYS" -o -name "*.ZST" \) > "$temp_file_list"
+            
+            local copied_count=0
+            while IFS= read -r file; do
+                echo "Copying: $file"
+                if rsync --progress "$file" "$dest/"; then
+                    echo "Successfully copied: $file"
+                    echo "$file=$(md5 -q "$file")" >> "$source/.offload"
+                    copied_count=$((copied_count + 1))
+                else
+                    echo "ERROR: Failed to copy: $file"
+                fi
+            done < "$temp_file_list"
+            
+            echo "Audio processing completed. Copied $copied_count files."
+            rm -f "$temp_file_list"
             ;;
         "Photo")
-            # No specific exclusions for photos
-            find "$source" -type f -print0 | while IFS= read -r -d '' file; do
-                rsync --progress "$file" "$dest/"
-                echo "$file=$(md5sum "$file" | cut -d' ' -f1)" >> "$source/.offload"
-            done
+            echo "Processing Photo files..."
+            # Create a temporary file list to avoid subshell issues
+            local temp_file_list="/tmp/offload_files_$$.txt"
+            find "$source" -type f > "$temp_file_list"
+            
+            local copied_count=0
+            while IFS= read -r file; do
+                echo "Copying: $file"
+                if rsync --progress "$file" "$dest/"; then
+                    echo "Successfully copied: $file"
+                    echo "$file=$(md5 -q "$file")" >> "$source/.offload"
+                    copied_count=$((copied_count + 1))
+                else
+                    echo "ERROR: Failed to copy: $file"
+                fi
+            done < "$temp_file_list"
+            
+            echo "Photo processing completed. Copied $copied_count files."
+            rm -f "$temp_file_list"
             ;;
         "Maintain")
+            echo "Processing with Maintain Folder Structure..."
             # Maintain folder structure but still skip system files
-            rsync --progress -r --exclude="*.thumbs" --exclude="*.xml" --exclude="*.CTG" --exclude="*.DAT" --exclude="*.CPC" --exclude="*.CPG" --exclude="*.B00" --exclude="*.D00" --exclude="*.SCR" --exclude="*.THM" --exclude="*.log" --exclude="*.jpg" --exclude="*.SYS" --exclude="*.ZST" "$source/" "$dest/"
-            find "$source" -type f -not \( -name "*.thumbs" -o -name "*.xml" -o -name "*.CTG" -o -name "*.DAT" -o -name "*.CPC" -o -name "*.CPG" -o -name "*.B00" -o -name "*.D00" -o -name "*.SCR" -o -name "*.THM" -o -name "*.log" -o -name "*.jpg" -o -name "*.SYS" -o -name "*.ZST" \) -print0 | while IFS= read -r -d '' file; do
-                echo "$file=$(md5sum "$file" | cut -d' ' -f1)" >> "$source/.offload"
+            if rsync --progress -r --exclude="*.thumbs" --exclude="*.xml" --exclude="*.XML" --exclude="*.CTG" --exclude="*.DAT" --exclude="*.CPC" --exclude="*.CPG" --exclude="*.B00" --exclude="*.D00" --exclude="*.SCR" --exclude="*.THM" --exclude="*.log" --exclude="*.jpg" --exclude="*.SYS" --exclude="*.ZST" "$source/" "$dest/"; then
+                echo "Successfully copied files with folder structure"
+            else
+                echo "ERROR: Failed to copy files with folder structure"
+            fi
+            
+            # Create hash list for verification
+            find "$source" -type f -not \( -name "*.thumbs" -o -name "*.xml" -o -name "*.XML" -o -name "*.CTG" -o -name "*.DAT" -o -name "*.CPC" -o -name "*.CPG" -o -name "*.B00" -o -name "*.D00" -o -name "*.SCR" -o -name "*.THM" -o -name "*.log" -o -name "*.jpg" -o -name "*.SYS" -o -name "*.ZST" \) -print0 | while IFS= read -r -d '' file; do
+                echo "$file=$(md5 -q "$file")" >> "$source/.offload"
             done
             ;;
     esac
     
     echo "TRANSFER_END=$(date +%s)" >> "$source/.offload"
+    echo "Offload completed."
 }
 
 # Function to verify files
@@ -198,7 +382,7 @@ verify_files() {
         if [[ "$source_file" == /* ]]; then
             local dest_file="$dest/$(basename "$source_file")"
             if [ -f "$dest_file" ]; then
-                local current_hash=$(md5sum "$dest_file" | cut -d' ' -f1)
+                local current_hash=$(md5 -q "$dest_file")
                 if [ "$current_hash" != "$hash" ]; then
                     echo "Hash mismatch for $source_file"
                     return 1
@@ -214,6 +398,17 @@ verify_files() {
     return 0
 }
 
+# Function to clean path (remove surrounding quotes)
+clean_path() {
+    local path="$1"
+    # Remove surrounding single or double quotes
+    path="${path%\"}"
+    path="${path%\'}"
+    path="${path#\"}"
+    path="${path#\'}"
+    echo "$path"
+}
+
 # Main offload function
 do_offload() {
     echo "SD Card Offload Tool"
@@ -222,6 +417,8 @@ do_offload() {
     # Get project information
     read -p "Enter project shortname: " PROJECT_NAME
     read -p "Enter destination folder path: " DEST_PATH
+    DEST_PATH=$(clean_path "$DEST_PATH")
+    echo "Cleaned destination path: $DEST_PATH"
 
     # Get list of mounted cards
     CARDS=($(get_mounted_cards))
@@ -283,8 +480,10 @@ do_verify() {
         if [ "$verify_card" = "y" ]; then
             if [ ! -f "$card/.offload" ]; then
                 read -p "No .offload file found. Enter destination folder path: " DEST_PATH
+                DEST_PATH=$(clean_path "$DEST_PATH")
             else
                 DEST_PATH=$(grep "^DEST_PATH=" "$card/.offload" | cut -d'=' -f2)
+                DEST_PATH=$(clean_path "$DEST_PATH")
             fi
             
             if verify_files "$card" "$DEST_PATH"; then
@@ -303,7 +502,7 @@ do_verify() {
 }
 
 # Main script
-case "${1:-}" in
+case "$COMMAND" in
     "offload")
         do_offload
         ;;
@@ -311,7 +510,8 @@ case "${1:-}" in
         do_verify
         ;;
     *)
-        echo "Usage: $0 {offload|verify}"
+        echo "Usage: $0 [-debug] {offload|verify}"
+        echo "  -debug: Enable debug output"
         echo "  offload: Offload files from SD cards"
         echo "  verify:  Verify previously offloaded files"
         exit 1
